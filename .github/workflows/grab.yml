@@ -1,0 +1,36 @@
+name: OCI Free-ARM Grabber
+
+on:
+  schedule:
+    - cron: "*/26 * * * *"   # every 26 minutes, 24/7
+  workflow_dispatch:
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OCI_USER: ocid1.user.oc1..aaaaaaaanchqchxufzmpp27m5ssfjan3ntnjdzgc7n2w3r6izsspsgadvx7a
+      OCI_FINGERPRINT: 32:f5:04:54:7d:dc:67:0f:ae:65:a3:d8:9a:ad:dd:4f
+      OCI_TENANCY: ocid1.tenancy.oc1..aaaaaaaanlusktnkyxysj3dor6cqenvzs23c6v3pkseh6aghiify7yuna5mq
+      OCI_REGION: us-phoenix-1
+      OCI_KEY_PATH: /home/runner/oci_key.pem
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Write OCI private key from secret
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          printf '%s' "$OCI_KEY" > "$HOME/oci_key.pem"
+          chmod 600 "$HOME/oci_key.pem"
+
+      - name: Install OCI SDK
+        run: pip install oci
+
+      - name: Run grabber (exits on success / already-running)
+        run: python grab.py
