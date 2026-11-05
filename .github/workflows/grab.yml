@@ -2,13 +2,19 @@ name: OCI Free-ARM Grabber
 
 on:
   schedule:
-    - cron: "*/26 * * * *"   # every 26 minutes, 24/7
+    - cron: "*/26 * * * *"   # every 26 minutes, 24/7 (unchanged)
   workflow_dispatch:
+
+# One grabber at a time, ever. Cancels a stale run instead of letting two
+# jobs stack up and both fire LaunchInstance at once (billing risk).
+concurrency:
+  group: oci-free-arm-grabber
+  cancel-in-progress: true
 
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 8        # single attempt finishes in ~1 min; 8 min hard cap
     env:
       OCI_USER: ocid1.user.oc1..aaaaaaaanchqchxufzmpp27m5ssfjan3ntnjdzgc7n2w3r6izsspsgadvx7a
       OCI_FINGERPRINT: 32:f5:04:54:7d:dc:67:0f:ae:65:a3:d8:9a:ad:dd:4f
@@ -30,7 +36,8 @@ jobs:
           chmod 600 "$HOME/oci_key.pem"
 
       - name: Install OCI SDK
-        run: pip install oci
+        run: pip install --disable-pip-version-check -q oci
 
-      - name: Run grabber (exits on success / already-running)
+      # grab.py is now ONE-SHOT: at most one LaunchInstance call, clean exit 0.
+      - name: Run grabber (one attempt, then exit)
         run: python grab.py
