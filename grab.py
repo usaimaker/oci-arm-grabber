@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""OCI free ARM (VM.Standard.A1.Flex) acquirer.
+"""OCI free ARM (VM.Standard.A1.Flex) acquirer -- ONE-SHOT.
 
-Runs 24/7 from GitHub Actions. Reads OCI identity from env vars (non-secret
-OCIDs / fingerprint / region) and the private key from OCI_KEY_PATH (written
-from the OCI_KEY secret). Tries to launch the retained boot volumes in both
-PHX ADs; exits the moment the instance is RUNNING. If the instance is already
-up, it exits cleanly so the job does not spin uselessly.
+Runs on a short cron from GitHub Actions. Each run performs AT MOST ONE
+LaunchInstance call, prints a machine-readable verdict, and exits 0.
+
+Why this rewrite (2026-11-05):
+  The old version was a `while True` loop with sleep(25). Combined with
+  timeout-minutes:25 it was killed by GitHub every single run (57/57
+  `cancelled`, 0 success) and piled up LaunchInstance requests. If capacity
+  ever opened, several queued requests could provision >1 A1.Flex at once and
+  blow past the Always Free allowance -> real billing. That is not acceptable.
+
+Design invariants (do NOT change without Alex's explicit OK):
+  * One process = ONE launch attempt. Never more than one instance per run.
+  * Never delete / terminate / detach anything. Never touch network or proxy.
+  * SDK auto-retry is disabled (NoneRetryStrategy) so one call = one request.
+  * If any A1.Flex already exists (any live state), do nothing and exit.
+  * Always exit 0 unless the SDK cannot even initialise -> 1 (for alerting).
+    A "no capacity" or "limit" verdict is a HEALTHY run, not a failure.
 """
 import os
 import sys
@@ -13,6 +25,7 @@ import time
 import tempfile
 
 import oci
+from oci.retry import NoneRetryStrategy
 
 # ---- non-secret identifiers (safe to hardcode) ----
 TEN = "ocid1.tenancy.oc1..aaaaaaaanlusktnkyxysj3dor6cqenvzs23c6v3pkseh6aghiify7yuna5mq"
@@ -51,7 +64,6 @@ def build_config():
         "region": os.environ["OCI_REGION"],
         "key_file": os.environ.get("OCI_KEY_PATH", "/home/runner/oci_key.pem"),
     }
-    # oci.config.from_file wants INI; write a temp one from the dict.
     fd, path = tempfile.mkstemp(suffix=".conf")
     with os.fdopen(fd, "w") as f:
         f.write("[DEFAULT]\n")
@@ -61,18 +73,26 @@ def build_config():
 
 
 def already_running(compute):
+    """Return (instance_id, shape) of a live A1.Flex, or (None, None).
+
+    On API failure return ('UNKNOWN', '') so main SKIPS this run entirely.
+    Skipping is always cheaper and safer than risking a duplicate instance.
+    """
     try:
         result = oci.pagination.list_call_get_all_results(
-            compute.list_instances, TEN, display_name=DISPLAY_NAME)
+            compute.list_instances, TEN)
         for inst in result.data:
             if inst.lifecycle_state in ("RUNNING", "PROVISIONING", "STARTING"):
-                return inst.id
+                if "A1" in (inst.shape or "") or inst.display_name == DISPLAY_NAME:
+                    return inst.id, inst.shape
+        return None, None
     except Exception as e:
-        print("already_running check err:", repr(e)[:140], flush=True)
-    return None
+        print("WARN already_running failed, skipping run:", repr(e)[:220], flush=True)
+        return "UNKNOWN", ""
 
 
 def try_launch(compute, ad, bv, subnet):
+    """ONE LaunchInstance call. Never retries, never waits for RUNNING."""
     details = oci.core.models.LaunchInstanceDetails(
         availability_domain=ad,
         compartment_id=TEN,
@@ -91,44 +111,46 @@ def try_launch(compute, ad, bv, subnet):
         resp = compute.launch_instance(details)
         iid = resp.data.id
         print("LAUNCHED in", ad, iid, flush=True)
-        for _ in range(50):
-            st = compute.get_instance(iid).data.lifecycle_state
-            if st == "RUNNING":
-                print("RUNNING", iid, flush=True)
-                return iid
-            if st in ("TERMINATED", "FAILED"):
-                print("BAD STATE", st, flush=True)
-                return None
-            time.sleep(8)
-        print("TIMEOUT waiting RUNNING", flush=True)
-        return None
+        return "LAUNCHED", iid
+    except oci.exceptions.ServiceError as e:
+        # Full error body: needed to tell LimitExceeded / Conflict / no-capacity apart.
+        print("SERVICE_ERROR status=", e.status, "code=", e.code,
+              "message=", str(e.message)[:700], flush=True)
+        blob = (str(e.code) + " " + str(e.message)).lower()
+        if "out of host capacity" in blob or "internalerror" in blob or "capacity" in blob:
+            return "NO_CAPACITY", None
+        if e.status == 400 or "limitexceeded" in blob:
+            return "BLOCKED_LIMIT_EXCEEDED", None
+        if e.status == 409 or "conflict" in blob:
+            return "BLOCKED_CONFLICT", None
+        return "ERROR_OTHER", None
     except Exception as e:
-        msg = repr(e)
-        if "Out of host capacity" in msg or "InternalError" in msg:
-            print("capacity busy in", ad, flush=True)
-        else:
-            print("err in", ad, msg[:160], flush=True)
-        return None
+        print("UNEXPECTED", repr(e)[:300], flush=True)
+        return "ERROR_OTHER", None
 
 
 def main():
-    config = build_config()
-    compute = oci.core.ComputeClient(config)
-    attempt = 0
-    while True:
-        attempt += 1
-        existing = already_running(compute)
-        if existing:
-            print("ALREADY_RUNNING", existing, flush=True)
-            sys.exit(0)
-        for (ad, bv, subnet) in TARGETS:
-            iid = try_launch(compute, ad, bv, subnet)
-            if iid:
-                print("SUCCESS_INSTANCE_ID=" + iid, flush=True)
-                sys.exit(0)
-        if attempt % 10 == 0:
-            print("heartbeat round", attempt, "still trying (free ARM capacity)", flush=True)
-        time.sleep(25)
+    try:
+        config = build_config()
+        compute = oci.core.ComputeClient(config, retry_strategy=NoneRetryStrategy())
+    except Exception as e:
+        print("FATAL SDK init:", repr(e)[:300], flush=True)
+        sys.exit(1)
+
+    existing, shape = already_running(compute)
+    if existing == "UNKNOWN":
+        print("VERDICT=SKIP_CHECK_FAILED", flush=True)
+        sys.exit(0)
+    if existing:
+        print("VERDICT=ALREADY_RUNNING", existing, shape, flush=True)
+        sys.exit(0)
+
+    # One launch per run. Alternate the AD each minute so both ADs get probed
+    # over time, while guaranteeing exactly one LaunchInstance call per run.
+    ad, bv, subnet = TARGETS[(int(time.time()) // 60) % len(TARGETS)]
+    verdict, iid = try_launch(compute, ad, bv, subnet)
+    print("VERDICT=" + verdict, ad, (iid or ""), flush=True)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
